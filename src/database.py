@@ -17,6 +17,7 @@ import hashlib
 import json
 import logging
 import queue
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     location        TEXT,
     job_type        TEXT,
     description     TEXT,
+    canonical_key   TEXT,
     first_seen_at   TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     refreshed_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     scrape_run_id   INTEGER,
@@ -85,11 +87,15 @@ CREATE TABLE IF NOT EXISTS criteria (
     disqualifiers TEXT,
     criteria_hash TEXT     NOT NULL UNIQUE,
     is_active     BOOLEAN  NOT NULL DEFAULT 0,
+    is_enabled    BOOLEAN  NOT NULL DEFAULT 0,
+    is_default    BOOLEAN  NOT NULL DEFAULT 0,
     created_at    TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
 )
 """,
-    "CREATE INDEX IF NOT EXISTS idx_criteria_active ON criteria(is_active)",
-    "CREATE INDEX IF NOT EXISTS idx_criteria_hash   ON criteria(criteria_hash)",
+    "CREATE INDEX IF NOT EXISTS idx_criteria_active  ON criteria(is_active)",
+    "CREATE INDEX IF NOT EXISTS idx_criteria_hash    ON criteria(criteria_hash)",
+    # Note: idx_criteria_enabled and idx_criteria_default are created in init_db()
+    # after the ALTER TABLE migration adds those columns to existing databases.
 
     # job_scores
     """
@@ -115,6 +121,20 @@ CREATE TABLE IF NOT EXISTS job_scores (
     "CREATE INDEX IF NOT EXISTS idx_job_scores_scored_at ON job_scores(scored_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_job_scores_job        ON job_scores(job_id)",
 
+    # job_actions
+    """
+CREATE TABLE IF NOT EXISTS job_actions (
+    action_id   INTEGER   PRIMARY KEY AUTOINCREMENT,
+    job_id      INTEGER   NOT NULL,
+    action_type TEXT      NOT NULL CHECK(action_type IN ('dismissed','saved','applied','archived','active')),
+    note        TEXT,
+    created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+)
+""",
+    "CREATE INDEX IF NOT EXISTS idx_job_actions_job       ON job_actions(job_id)",
+    "CREATE INDEX IF NOT EXISTS idx_job_actions_type_time ON job_actions(action_type, created_at DESC)",
+
     # job_insights
     """
 CREATE TABLE IF NOT EXISTS job_insights (
@@ -129,42 +149,37 @@ CREATE TABLE IF NOT EXISTS job_insights (
     FOREIGN KEY (scrape_run_id) REFERENCES scrape_runs(run_id) ON DELETE SET NULL
 )
 """,
-
-    # views
-    """
-CREATE VIEW IF NOT EXISTS jobs_unscored AS
-SELECT j.job_id, j.job_url, j.title, j.company, j.location, j.description, j.site, j.job_type
-FROM jobs j
-LEFT JOIN job_scores js
-       ON j.job_id = js.job_id
-      AND js.criteria_id = (SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1)
-WHERE js.score_id IS NULL
-ORDER BY j.refreshed_at DESC
-""",
-    """
-CREATE VIEW IF NOT EXISTS jobs_qualified AS
-SELECT
-    j.job_id, j.job_url, j.title, j.company, j.location, j.job_type, j.site,
-    j.first_seen_at, j.refreshed_at,
-    js.score_overall, js.score_relevance, js.score_duties, js.score_income,
-    js.reasoning, js.scored_at,
-    c.name AS criteria_name
-FROM jobs j
-INNER JOIN job_scores js ON j.job_id = js.job_id
-INNER JOIN criteria c    ON js.criteria_id = c.criteria_id
-WHERE js.is_qualified = 1
-  AND c.is_active = 1
-ORDER BY js.score_overall DESC
-""",
 ]
+
+# ── Canonical key ────────────────────────────────────────────────────────────
+
+_TITLE_PREFIXES = re.compile(r"\b(sr|jr|senior|staff|principal|lead|associate)\.?\s*", re.I)
+_COMPANY_SUFFIXES = re.compile(r"\b(inc|llc|ltd|corp|co)\.?\s*$", re.I)
+
+
+def _normalize_title(title: str) -> str:
+    t = _TITLE_PREFIXES.sub("", title.lower()).strip()
+    return re.sub(r"\s+", " ", t)
+
+
+def _normalize_company(company: str) -> str:
+    c = _COMPANY_SUFFIXES.sub("", company.lower()).strip()
+    return re.sub(r"\s+", " ", c)
+
+
+def make_canonical_key(title: str, company: str) -> str:
+    """Normalized dedup key for grouping the same job listing across sites."""
+    return _normalize_company(company) + "|" + _normalize_title(title)
+
 
 # SQL used by multiple callers
 UPSERT_JOB_SQL = """
-INSERT INTO jobs (job_url, site, title, company, location, job_type, description, scrape_run_id)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO jobs (job_url, site, title, company, location, job_type, description, canonical_key, scrape_run_id)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(job_url) DO UPDATE SET
     title         = excluded.title,
     refreshed_at  = CURRENT_TIMESTAMP,
+    canonical_key = excluded.canonical_key,
     scrape_run_id = excluded.scrape_run_id
 """
 
@@ -180,6 +195,35 @@ INSERT INTO job_insights (skills_advice, jobs_analyzed_count, model_name)
 VALUES (?, ?, ?)
 """
 
+
+# ── View definitions (always recreated to pick up definition changes) ─────────
+
+_VIEW_JOBS_UNSCORED = """
+CREATE VIEW jobs_unscored AS
+SELECT j.job_id, j.job_url, j.title, j.company, j.location, j.description, j.site, j.job_type
+FROM jobs j
+LEFT JOIN job_scores js
+       ON j.job_id = js.job_id
+      AND js.criteria_id = (SELECT criteria_id FROM criteria WHERE is_default = 1 LIMIT 1)
+WHERE js.score_id IS NULL
+ORDER BY j.refreshed_at DESC
+"""
+
+_VIEW_JOBS_QUALIFIED = """
+CREATE VIEW jobs_qualified AS
+SELECT
+    j.job_id, j.job_url, j.title, j.company, j.location, j.job_type, j.site,
+    j.first_seen_at, j.refreshed_at,
+    js.score_overall, js.score_relevance, js.score_duties, js.score_income,
+    js.reasoning, js.scored_at,
+    c.name AS criteria_name
+FROM jobs j
+INNER JOIN job_scores js ON j.job_id = js.job_id
+INNER JOIN criteria c    ON js.criteria_id = c.criteria_id
+WHERE js.is_qualified = 1
+  AND c.is_default = 1
+ORDER BY js.score_overall DESC
+"""
 
 # ── Connection helper ─────────────────────────────────────────────────────────
 
@@ -203,6 +247,58 @@ def init_db(db_path: Path) -> None:
         stmt = stmt.strip()
         if stmt:
             conn.execute(stmt)
+    # Additive migration: add canonical_key column to existing DBs
+    try:
+        conn.execute("ALTER TABLE jobs ADD COLUMN canonical_key TEXT")
+        log.info("Migration: added canonical_key column to jobs")
+    except sqlite3.OperationalError:
+        pass  # column already present on new or previously-migrated DBs
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_canonical ON jobs(canonical_key)")
+    # Backfill rows that pre-date this column
+    rows = conn.execute(
+        "SELECT job_id, title, company FROM jobs WHERE canonical_key IS NULL"
+    ).fetchall()
+    if rows:
+        updates = [
+            (make_canonical_key(r["title"], r["company"]), r["job_id"]) for r in rows
+        ]
+        conn.executemany("UPDATE jobs SET canonical_key = ? WHERE job_id = ?", updates)
+        log.info(f"Backfilled canonical_key for {len(rows)} existing jobs")
+
+    # Additive migration: add is_enabled / is_default to criteria (Feature 2)
+    for col, default in [("is_enabled", 0), ("is_default", 0)]:
+        try:
+            conn.execute(f"ALTER TABLE criteria ADD COLUMN {col} BOOLEAN NOT NULL DEFAULT {default}")
+            log.info(f"Migration: added {col} column to criteria")
+        except sqlite3.OperationalError:
+            pass  # column already present
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_criteria_enabled ON criteria(is_enabled)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_criteria_default ON criteria(is_default)")
+    # Backfill: the previously-active criteria becomes is_enabled=1, is_default=1
+    conn.execute(
+        "UPDATE criteria SET is_enabled = 1, is_default = 1 WHERE is_active = 1 AND is_default = 0"
+    )
+
+    # Additive migration: create job_actions table for dismissal (Feature 1)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS job_actions (
+            action_id   INTEGER   PRIMARY KEY AUTOINCREMENT,
+            job_id      INTEGER   NOT NULL,
+            action_type TEXT      NOT NULL CHECK(action_type IN ('dismissed','saved','applied','archived','active')),
+            note        TEXT,
+            created_at  TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (job_id) REFERENCES jobs(job_id) ON DELETE CASCADE
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_job_actions_job       ON job_actions(job_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_job_actions_type_time ON job_actions(action_type, created_at DESC)")
+
+    # Always recreate views so definition changes take effect on existing DBs
+    conn.execute("DROP VIEW IF EXISTS jobs_unscored")
+    conn.execute("DROP VIEW IF EXISTS jobs_qualified")
+    conn.execute(_VIEW_JOBS_UNSCORED.strip())
+    conn.execute(_VIEW_JOBS_QUALIFIED.strip())
+
     conn.commit()
     conn.close()
     log.debug(f"Database initialized: {db_path}")
@@ -240,16 +336,19 @@ def get_or_create_criteria(db_path: Path, cfg: dict[str, Any]) -> int:
     if row:
         criteria_id = row["criteria_id"]
         if not row["is_active"]:
-            conn.execute("UPDATE criteria SET is_active = 0")
-            conn.execute("UPDATE criteria SET is_active = 1 WHERE criteria_id = ?", (criteria_id,))
+            conn.execute("UPDATE criteria SET is_active = 0, is_default = 0")
+            conn.execute(
+                "UPDATE criteria SET is_active = 1, is_enabled = 1, is_default = 1 WHERE criteria_id = ?",
+                (criteria_id,),
+            )
             conn.commit()
             log.info(f"Reactivated existing criteria id={criteria_id}")
     else:
-        conn.execute("UPDATE criteria SET is_active = 0")
+        conn.execute("UPDATE criteria SET is_active = 0, is_default = 0")
         cur = conn.execute(
             """
-            INSERT INTO criteria (name, description, weights, qualifiers, disqualifiers, criteria_hash, is_active)
-            VALUES (?, ?, ?, ?, ?, ?, 1)
+            INSERT INTO criteria (name, description, weights, qualifiers, disqualifiers, criteria_hash, is_active, is_enabled, is_default)
+            VALUES (?, ?, ?, ?, ?, ?, 1, 1, 1)
             """,
             (
                 criteria_name,
@@ -323,10 +422,19 @@ def finish_scrape_run(
 
 # ── Read helpers ──────────────────────────────────────────────────────────────
 
-def get_unscored_jobs(db_path: Path, limit: int = 2000) -> list[dict]:
-    """Return jobs not yet scored under the active criteria."""
+def get_unscored_jobs(db_path: Path, criteria_id: int, limit: int = 2000) -> list[dict]:
+    """Return jobs not yet scored under the given criteria_id."""
     conn = _open_conn(db_path)
-    rows = conn.execute("SELECT * FROM jobs_unscored LIMIT ?", (limit,)).fetchall()
+    rows = conn.execute(
+        """
+        SELECT j.job_id, j.job_url, j.title, j.company, j.location, j.description, j.site, j.job_type
+        FROM jobs j
+        LEFT JOIN job_scores js ON j.job_id = js.job_id AND js.criteria_id = ?
+        WHERE js.score_id IS NULL
+        ORDER BY j.refreshed_at DESC LIMIT ?
+        """,
+        (criteria_id, limit),
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -351,11 +459,11 @@ def db_status(db_path: Path) -> dict[str, int]:
     unscored = conn.execute("SELECT COUNT(*) FROM jobs_unscored").fetchone()[0]
     qualified = conn.execute(
         "SELECT COUNT(*) FROM job_scores WHERE is_qualified = 1"
-        " AND criteria_id = (SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1)"
+        " AND criteria_id = (SELECT criteria_id FROM criteria WHERE is_default = 1 LIMIT 1)"
     ).fetchone()[0]
     disqualified = conn.execute(
         "SELECT COUNT(*) FROM job_scores WHERE is_qualified = 0"
-        " AND criteria_id = (SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1)"
+        " AND criteria_id = (SELECT criteria_id FROM criteria WHERE is_default = 1 LIMIT 1)"
     ).fetchone()[0]
     scrape_runs = conn.execute("SELECT COUNT(*) FROM scrape_runs").fetchone()[0]
     conn.close()
@@ -366,6 +474,47 @@ def db_status(db_path: Path) -> dict[str, int]:
         "disqualified": disqualified,
         "scrape_runs": scrape_runs,
     }
+
+
+def get_all_enabled_criteria(db_path: Path) -> list[int]:
+    """Return criteria_ids for all enabled criteria (those that score new jobs)."""
+    conn = _open_conn(db_path)
+    rows = conn.execute("SELECT criteria_id FROM criteria WHERE is_enabled = 1").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def record_job_action(db_path: Path, job_id: int, action_type: str, note: str | None = None) -> None:
+    """Record a user action against a job (e.g. dismissed, saved, applied).
+
+    dismissed and active (restore) propagate to all jobs sharing the same
+    canonical_key so deduped siblings are hidden/restored together.
+    """
+    conn = _open_conn(db_path)
+    # Propagate dismissed / restore to all canonical siblings
+    if action_type in ("dismissed", "active"):
+        row = conn.execute("SELECT canonical_key FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+        canonical_key = row[0] if row else None
+        if canonical_key:
+            sibling_ids = [
+                r[0]
+                for r in conn.execute(
+                    "SELECT job_id FROM jobs WHERE canonical_key = ?", (canonical_key,)
+                ).fetchall()
+            ]
+            conn.executemany(
+                "INSERT INTO job_actions (job_id, action_type, note) VALUES (?, ?, ?)",
+                [(sid, action_type, note) for sid in sibling_ids],
+            )
+            conn.commit()
+            conn.close()
+            return
+    conn.execute(
+        "INSERT INTO job_actions (job_id, action_type, note) VALUES (?, ?, ?)",
+        (job_id, action_type, note),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ── Write queue ───────────────────────────────────────────────────────────────
@@ -429,33 +578,42 @@ class SQLiteWriteQueue:
         def commit_batch() -> None:
             if not batch:
                 return
-            for op in batch:
-                cur = conn.execute(op.sql, op.params)
-                # Heuristic: rowcount==1 + lastrowid changed → INSERT; else UPDATE
-                if cur.lastrowid and cur.rowcount == 1:
-                    with self._lock:
-                        self._new_count += 1
-                elif cur.rowcount > 0:
-                    with self._lock:
-                        self._update_count += 1
-            conn.commit()
-            batch.clear()
-
-        while True:
             try:
-                op = self._q.get(timeout=0.1)
-                if op is None:          # sentinel → flush and exit
-                    commit_batch()
-                    self._q.task_done()
-                    break
-                batch.append(op)
-                self._q.task_done()
-                if len(batch) >= self._batch_size:
-                    commit_batch()
-            except queue.Empty:
-                commit_batch()          # flush partial batch on idle
+                for op in batch:
+                    cur = conn.execute(op.sql, op.params)
+                    # Heuristic: rowcount==1 + lastrowid changed → INSERT; else UPDATE
+                    if cur.lastrowid and cur.rowcount == 1:
+                        with self._lock:
+                            self._new_count += 1
+                    elif cur.rowcount > 0:
+                        with self._lock:
+                            self._update_count += 1
+                conn.commit()
+            except Exception as e:
+                log.error(f"DB write batch failed ({len(batch)} ops), rolling back: {e}")
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            finally:
+                batch.clear()
 
-        conn.close()
+        try:
+            while True:
+                try:
+                    op = self._q.get(timeout=0.1)
+                    if op is None:          # sentinel → flush and exit
+                        commit_batch()
+                        self._q.task_done()
+                        break
+                    batch.append(op)
+                    self._q.task_done()
+                    if len(batch) >= self._batch_size:
+                        commit_batch()
+                except queue.Empty:
+                    commit_batch()          # flush partial batch on idle
+        finally:
+            conn.close()
 
 
 # ── Migration ─────────────────────────────────────────────────────────────────
@@ -502,8 +660,8 @@ def migrate_from_csv_json(
                     continue
                 conn.execute(
                     "INSERT OR IGNORE INTO jobs"
-                    " (job_url, site, title, company, location, job_type, description, scrape_run_id)"
-                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    " (job_url, site, title, company, location, job_type, description, canonical_key, scrape_run_id)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         url,
                         row.get("site", ""),
@@ -512,6 +670,7 @@ def migrate_from_csv_json(
                         row.get("location"),
                         row.get("job_type"),
                         row.get("description"),
+                        make_canonical_key(row.get("title", ""), row.get("company", "")),
                         run_id,
                     ),
                 )

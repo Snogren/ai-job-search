@@ -1,6 +1,6 @@
 ---
 name: AI Job Search Agent
-status: done
+status: active
 ---
 
 ## Problem
@@ -47,6 +47,48 @@ LLM provider is **OpenRouter**. CrewAI uses LiteLLM internally, which routes to 
 ### Milestone 5 — Output & Scheduling ✓
 - [x] Write top-N results (scored + annotated) to `output/results_YYYY-MM-DD.md`
 - [x] Optionally add a cron job or shell alias (`jobsearch`) to run daily
+
+### Milestone 6 — DB + Viewer ✓
+- [x] SQLite schema: `jobs`, `criteria`, `job_scores`, `job_actions`, `scrape_runs`, `job_insights`
+- [x] `SQLiteWriteQueue` single-writer thread for safe concurrent scraper writes
+- [x] Multiple criteria sets: score the same job against several criteria independently
+- [x] `canonical_key` dedup: cross-site alias grouping; "also on X" badges in viewer
+- [x] Job dismissal: hide reviewed-and-rejected jobs without deleting them
+- [x] FastAPI web viewer (`viewer.py`): filter by site / location / job type / score / criteria
+
+### Milestone 7 — UI Control Plane (planning)
+
+Full details: `milestones/m7-ui-job-scoring-manager.md`
+
+#### M7.1 — Criteria Manager backend
+- [ ] API endpoints in `viewer.py`: `GET/POST /criteria`, `GET/PUT /criteria/{id}`, `POST /criteria/{id}/set-default`, `DELETE /criteria/{id}`
+- [ ] DB helpers: `list_criteria`, `get_criteria_by_id`, `create_criteria`, `update_criteria`, `set_default_criteria`, `disable_criteria`
+- [ ] Weight normalization on save; recompute `criteria_hash`
+
+#### M7.2 — Criteria Manager UI
+- [ ] `templates/criteria.html` — list page (create/edit/delete/set-default)
+- [ ] `templates/criteria_form.html` — form with live weight normalization preview
+- [ ] Nav link in `jobs.html` header
+
+#### M7.3 — Background pipeline runner
+- [ ] `RunManager` (in `src/runner.py`): starts `python src/main.py` as subprocess, captures stdout/stderr, exposes log buffer + status
+- [ ] `POST /search/start` — validates form params, invokes RunManager, redirects to `/run/{run_id}`
+- [ ] `DELETE /run/{run_id}` — kills subprocess
+- [ ] In-memory `run_registry: dict[int, RunManager]` keyed by `scrape_run_id`
+
+#### M7.4 — Search Launch UI
+- [ ] `templates/search.html` — launch form (criteria, boards, keywords, location, counts, mode)
+- [ ] `GET /search` route; pre-populate defaults from `config.yaml`
+
+#### M7.5 — Live Log Streaming
+- [ ] `GET /run/{run_id}/log` SSE endpoint — streams RunManager log buffer line-by-line
+- [ ] `templates/run.html` — log window (auto-scroll, status badge, stop button, "View Results" link)
+- [ ] `GET /runs` + `templates/runs.html` — run history table
+
+#### M7.6 — Real-time Job Board Updates
+- [ ] `GET /jobs/live` SSE endpoint — polls DB for new `job_scores` and pushes as JSON events
+- [ ] `GET /jobs/progress` endpoint — `{scored, total, running}`
+- [ ] Update `jobs.html`: EventSource subscription, animated card append, progress bar, toast
 
 ## Notes
 

@@ -1,5 +1,5 @@
 # Job Sites Research Report
-**Date:** March 12, 2026  
+**Date:** March 12, 2026 (updated March 13, 2026)  
 **Purpose:** Evaluate additional job sites to expand the ai-job-search pipeline  
 **Scope:** QA Lead / SDET / Quality Engineer, remote positions
 
@@ -45,6 +45,7 @@ These require writing a custom adapter (a new function in `scraper.py` or a sepa
 | **Himalayas** | REST (JSON) | None — fully public | Max **20 jobs per request** (reduced March 2025); paginate with offset | Good — curated remote tech jobs, salary data included | Low — paginate to desired count | **Add** |
 | **Arbeitnow** | REST (JSON) | None — fully public | No documented limit | Low-Medium — European/global remote focus, fewer US QA roles | Very Low — single paginated GET | **Consider** (good for non-US remote roles) |
 | **Jobicy** | REST (JSON) | None — fully public | No documented limit | Low-Medium — smaller board, general remote jobs | Very Low | **Consider** |
+| **USAJobs** | REST (JSON) | User-Agent header with email (free registration) | No documented limit; official US Gov API | Medium — federal/government tech roles, DoD/contractor pipeline | Low — header-auth only, `usajobs` PyPI wrapper available | **Consider** — niche but unique coverage |
 | **The Muse** | REST (JSON) | None for jobs endpoint | 500 req/day (generous) | Low — focuses on company culture profiles, fewer QA postings | Low | **Skip** — low QA signal |
 | **jsearch (RapidAPI)** | REST (JSON) | RapidAPI key (freemium) | 200 req/month free tier | High — aggregates Indeed, LinkedIn, Glassdoor | Medium — RapidAPI dependency; limited free quota | **Skip** — same boards covered cheaper via JobSpy |
 | **Reed.co.uk** | REST (JSON) | API key (free registration) | ~100 requests/hour | Low for US-based QA roles — UK-centric | Low | **Skip** unless targeting UK remote |
@@ -69,6 +70,10 @@ GET https://www.arbeitnow.com/api/job-board-api?remote=true&search=qa
 
 # Jobicy — no auth
 GET https://jobicy.com/api/v2/remote-jobs?count=50&keyword=qa+lead
+
+# USAJobs — requires User-Agent header: "AppName/1.0 email@example.com"
+GET https://data.usajobs.gov/api/search?Keyword=software+engineer&ResultsPerPage=25
+# PyPI wrapper: pip install usajobs
 ```
 
 ---
@@ -85,7 +90,9 @@ GET https://jobicy.com/api/v2/remote-jobs?count=50&keyword=qa+lead
 | **Authentic Jobs** | Creative/tech | HTML scraping | Low | Small board; minimal QA activity |
 | **Stack Overflow Jobs** | Developer-focused | **Discontinued (2022)** | N/A | No longer operational |
 | **Remote.co** | Remote-only | HTML scraping | Low | Small board; broader than QA-specific |
-| **Hacker News (Who's Hiring)** | Startup hiring threads | HN Algolia API (free) | Medium | Monthly thread; QA roles occur but infrequently; unstructured text requires extra parsing |
+| **Hacker News (Who's Hiring)** | Startup hiring threads | HN Algolia API (free) | Medium | Monthly thread; QA roles occur but infrequently; unstructured text requires LLM parsing. Best implementation: query `hn.algolia.com/api/v1/search?tags=comment,story_43492218` for the current month's thread, then pass comments to LLM to extract structured fields. OSS reference: `gabfl/hn-whoishiring` (FastAPI app). Apify actor `deadlyaccurate/hn-jobs-scraper` has 46 tests and open-source TypeScript library if zero-dependency parsing is needed. |
+| **Arc.dev** | Vetted remote developer marketplace | No public API; login/profile required | Medium-High | Profile-gated: developers apply via profile; no way to query listings programmatically. **Ruled out** — no API surface. |
+| **Handshake** | College students / entry-level | EDU API (institutional credentials only) | Low | EDU API requires a university partnership credential. Public job scraping requires login. **Ruled out** — not applicable to experienced-hire search. |
 
 ---
 
@@ -103,7 +110,8 @@ GET https://jobicy.com/api/v2/remote-jobs?count=50&keyword=qa+lead
 | Arbeitnow API | 2 | 1 | Low | **Consider** (EU/global roles) |
 | Dice.com | 4 | 4 | Medium | **Consider** — high QA value but brittle scraper |
 | Jobicy API | 2 | 1 | Low | **Consider** — minor extra coverage |
-| Hacker News | 2 | 3 | Low | **Consider** — requires custom parser |
+| USAJobs API | 2 | 2 | Low | **Consider** — unique federal/gov coverage; free official API |
+| Hacker News | 2 | 3 | Low | **Consider** — requires LLM parsing; unique startup signal |
 | We Work Remotely | 2 | 3 | Medium | **Skip** — low QA yield for effort |
 | Wellfound | 2 | 5 | Medium | **Skip** — login wall, bot detection |
 | FlexJobs | 3 | 5 | High | **Skip** — paywalled |

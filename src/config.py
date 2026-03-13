@@ -2,6 +2,7 @@
 src/config.py — load config.yaml for the job search pipeline.
 """
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -36,13 +37,19 @@ def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
 
 
 def get_disqualifiers(config: dict[str, Any]) -> list[str]:
-    """Return disqualifying descriptions from config (evaluated by the LLM)."""
-    return [str(d) for d in config.get("disqualifiers", [])]
+    """Return disqualifying descriptions from config (evaluated by the LLM).
+    Reads from criteria.disqualifiers (new location) with fallback to top-level disqualifiers."""
+    c = config.get("criteria", {})
+    items = c.get("disqualifiers") or config.get("disqualifiers", [])
+    return [str(d) for d in items]
 
 
 def get_qualifiers(config: dict[str, Any]) -> list[str]:
-    """Return qualifying descriptions from config (evaluated by the LLM)."""
-    return [str(q) for q in config.get("qualifiers", [])]
+    """Return qualifying descriptions from config (evaluated by the LLM).
+    Reads from criteria.qualifiers (new location) with fallback to top-level qualifiers."""
+    c = config.get("criteria", {})
+    items = c.get("qualifiers") or config.get("qualifiers", [])
+    return [str(q) for q in items]
 
 
 def get_criteria_weights(config: dict[str, Any]) -> dict[str, float]:
@@ -79,3 +86,17 @@ def build_criteria_string(config: dict[str, Any]) -> str:
         parts.append(f"  Score  1 (worst): {cat.get('worst', 'Not specified')}")
         parts.append("")
     return "\n".join(parts).rstrip()
+
+
+def get_model_config(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Return model settings from config.yaml, with env var fallbacks for backward compat.
+
+    Non-secret settings (model name, base_url, parallelism) live in config.yaml.
+    The API key remains in .env.
+    """
+    model = cfg.get("model", {})
+    return {
+        "name": model.get("name") or os.getenv("CREWAI_MODEL", "openrouter/anthropic/claude-3.5-sonnet"),
+        "base_url": model.get("base_url", "https://openrouter.ai/api/v1"),
+        "parallel_workers": model.get("parallel_workers") or cfg.get("scoring", {}).get("parallel_workers", 10),
+    }

@@ -30,7 +30,7 @@ load_dotenv()
 import litellm
 from crewai import Agent, Crew, LLM, Task
 
-from config import build_criteria_string, get_criteria_weights, get_disqualifiers, get_qualifiers, load_config
+from config import build_criteria_string, get_criteria_weights, get_disqualifiers, get_model_config, get_qualifiers, load_config
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -41,13 +41,13 @@ OUTPUT_DIR = PROJECT_ROOT / "output"
 
 # ── LLM ─────────────────────────────────────────────────────────────────────
 
-def get_llm_config() -> dict:
+def get_llm_config(cfg: dict | None = None) -> dict:
+    mc = get_model_config(cfg or load_config())
     api_key = os.getenv("OPENROUTER_API_KEY")
-    model = os.getenv("CREWAI_MODEL", "openrouter/anthropic/claude-3.5-sonnet")
     if not api_key:
         log.error("OPENROUTER_API_KEY not set in .env")
         sys.exit(1)
-    return {"model": model, "api_key": api_key, "base_url": "https://openrouter.ai/api/v1"}
+    return {"model": mc["name"], "api_key": api_key, "base_url": mc["base_url"]}
 
 
 def get_llm(llm_config: dict | None = None) -> LLM:
@@ -355,7 +355,7 @@ def main() -> None:
     cfg = load_config()
     criteria_cfg = cfg.get("criteria", {})
     config_criteria = build_criteria_string(cfg)
-    config_top_n = criteria_cfg.get("top_n", 10)
+    config_top_n = cfg.get("display", {}).get("top_n") or criteria_cfg.get("top_n", 10)
 
     parser = argparse.ArgumentParser(description="Score scraped job listings with CrewAI.")
     parser.add_argument(
@@ -388,7 +388,7 @@ def main() -> None:
 
     log.info(f"Criteria: {criteria[:120]}{'...' if len(criteria) > 120 else ''}")
 
-    parallel_workers = cfg.get("scoring", {}).get("parallel_workers", 10)
+    parallel_workers = get_model_config(cfg).get("parallel_workers", 10)
     out_path = run_pipeline(
         csv_path=csv_path,
         criteria=criteria,
@@ -411,17 +411,17 @@ if __name__ == "__main__":
 def run_analysis(
     db_path: Path,
     cfg: dict,
-    criteria_id: int,
+    criteria_id: int | list[int],
     top_n: int = 50,
     parallel_workers: int = 10,
 ) -> int:
-    """Score all unscored jobs in the DB under the active criteria.
+    """Score all unscored jobs in the DB under each enabled criteria.
 
-    Reads from the jobs_unscored view (jobs with no score under criteria_id),
-    runs LLM scoring in parallel, writes results to job_scores via the write
-    queue, then runs the Skills Advisor and writes to job_insights.
+    Accepts a single criteria_id (int) or a list for multi-criteria scoring.
+    Reads unscored jobs via parameterized query so each criteria's unscored
+    set is independent.
 
-    Returns the number of jobs scored.
+    Returns the total number of jobs scored across all criteria.
     """
     from database import (  # local import avoids circular dependency at module load
         INSERT_INSIGHT_SQL,
@@ -432,66 +432,83 @@ def run_analysis(
     )
     from config import build_criteria_string, get_criteria_weights, get_disqualifiers, get_qualifiers
 
+    criteria_ids = [criteria_id] if isinstance(criteria_id, int) else list(criteria_id)
+
     criteria = build_criteria_string(cfg)
     weights = get_criteria_weights(cfg)
     qualifiers = get_qualifiers(cfg)
     disqualifiers = get_disqualifiers(cfg)
-    llm_config = get_llm_config()
+    llm_config = get_llm_config(cfg)
     model_name = llm_config["model"].split("/")[-1]
 
-    jobs = get_unscored_jobs(db_path)
-    if not jobs:
+    total_scored = 0
+    total_qualified = 0
+    writer = SQLiteWriteQueue(db_path)
+
+    for cid in criteria_ids:
+        jobs = get_unscored_jobs(db_path, cid)
+        if not jobs:
+            log.info(f"No unscored jobs for criteria_id={cid} — skipping.")
+            continue
+
+        log.info(f"Scoring {len(jobs)} unscored jobs for criteria_id={cid} ({parallel_workers} parallel workers)...")
+
+        scored_count = 0
+        qualified_count = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+            futures = {
+                executor.submit(
+                    score_single_job, job, criteria, llm_config, weights, qualifiers, disqualifiers
+                ): job
+                for job in jobs
+            }
+            for future in concurrent.futures.as_completed(futures):
+                result = future.result()
+                job_id = futures[future].get("job_id")
+                if job_id is None:
+                    continue
+
+                is_qualified = not result.get("disqualified", False)
+                dq_reason = result.get("disqualified_by") if not is_qualified else None
+
+                writer.enqueue(
+                    INSERT_SCORE_SQL,
+                    (
+                        job_id,
+                        cid,
+                        is_qualified,
+                        dq_reason,
+                        result.get("score"),
+                        result.get("score_relevance"),
+                        result.get("score_duties"),
+                        result.get("score_income"),
+                        result.get("reasoning", ""),
+                        model_name,
+                    ),
+                )
+                scored_count += 1
+                if is_qualified:
+                    qualified_count += 1
+                    score_str = f"{result['score']:.1f}/10" if result["score"] is not None else "?/10"
+                    log.info(f"  ✓ {result['title']} @ {result['company']} → {score_str}")
+                else:
+                    log.info(f"  ✗ Disqualified: '{result['title']}' — {dq_reason or ''}")
+
+        writer.flush()
+        total_scored += scored_count
+        total_qualified += qualified_count
+        log.info(
+            f"criteria_id={cid}: {scored_count} scored, {qualified_count} qualified,"
+            f" {scored_count - qualified_count} disqualified"
+        )
+
+    if total_scored == 0:
         log.info("No unscored jobs found — nothing to analyze.")
+        writer.close()
         return 0
 
-    log.info(f"Scoring {len(jobs)} unscored jobs ({parallel_workers} parallel workers)...")
-
-    writer = SQLiteWriteQueue(db_path)
-    scored_count = 0
-    qualified_count = 0
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-        futures = {
-            executor.submit(
-                score_single_job, job, criteria, llm_config, weights, qualifiers, disqualifiers
-            ): job
-            for job in jobs
-        }
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            job_id = futures[future].get("job_id")
-            if job_id is None:
-                continue
-
-            is_qualified = not result.get("disqualified", False)
-            dq_reason = result.get("disqualified_by") if not is_qualified else None
-
-            writer.enqueue(
-                INSERT_SCORE_SQL,
-                (
-                    job_id,
-                    criteria_id,
-                    is_qualified,
-                    dq_reason,
-                    result.get("score"),
-                    result.get("score_relevance"),
-                    result.get("score_duties"),
-                    result.get("score_income"),
-                    result.get("reasoning", ""),
-                    model_name,
-                ),
-            )
-            scored_count += 1
-            if is_qualified:
-                qualified_count += 1
-                score_str = f"{result['score']:.1f}/10" if result["score"] is not None else "?/10"
-                log.info(f"  ✓ {result['title']} @ {result['company']} → {score_str}")
-            else:
-                log.info(f"  ✗ Disqualified: '{result['title']}' — {dq_reason or ''}")
-
-    writer.flush()
-
-    # ── Skills Advisor ────────────────────────────────────────────────────────
+    # ── Skills Advisor (runs once, using the default criteria's qualified jobs) ─
     conn = _open_conn(db_path)
     top_rows = conn.execute(
         "SELECT title, company, location, score_overall, reasoning"
@@ -543,12 +560,9 @@ def run_analysis(
         log.info("Running Skills Advisor...")
         crew.kickoff()
         skills_advice = strip_thinking_tags(advisor_task.output.raw if advisor_task.output else "")
-        writer.enqueue(INSERT_INSIGHT_SQL, (skills_advice, scored_count, model_name))
+        writer.enqueue(INSERT_INSIGHT_SQL, (skills_advice, total_scored, model_name))
 
     writer.close()
 
-    log.info(
-        f"Analysis complete: {scored_count} scored, {qualified_count} qualified,"
-        f" {scored_count - qualified_count} disqualified"
-    )
-    return scored_count
+    log.info(f"Analysis complete: {total_scored} scored total, {total_qualified} qualified")
+    return total_scored

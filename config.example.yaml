@@ -2,16 +2,20 @@
 # config.yaml is gitignored (personal preferences). This file is safe to commit.
 
 # ── Search ────────────────────────────────────────────────────────────────────
+# What to scrape and from where.
 search:
-  term: "your job title here"        # e.g. "python backend engineer"
-  location: "remote"                 # e.g. "remote", "New York, NY", "San Francisco"
-  hours_old: 72                      # only list jobs posted within this many hours
+  keywords:                          # list of search terms; each runs a separate parallel scrape
+    - "your job title here"          # e.g. "senior python engineer"
+    - "alternate title here"         # add as many as you want
+  term: "your job title here"        # legacy scalar fallback (used if 'keywords' is absent)
+  location: "remote"                 # e.g. "remote", "New York, NY"
+  hours_old: 72                      # only return jobs posted within this many hours
   results_per_site: 25               # max results to fetch per job board
-  sites:                             # boards to scrape (any of: indeed, linkedin, glassdoor, zip_recruiter, google)
+  sites:                             # boards to scrape
     - indeed
     - zip_recruiter
-    - google          # aggregates from company ATS + hundreds of boards
-    - linkedin        # highest volume; keep results_per_site ≤ 25 to avoid rate limits
+    - google
+    - linkedin
     # - glassdoor   # optional: moderate value, ToS risk
 
 # ── Optional API Sources (no scraping, no ToS risk) ───────────────────────────
@@ -21,26 +25,28 @@ api_sources:
   adzuna:
     app_id: ""        # register free at developer.adzuna.com
     app_key: ""
-# ── Scoring ───────────────────────────────────────────────────────────────────
-scoring:
-  parallel_workers: 10  # concurrent LLM calls during scoring
-# ── Disqualifiers ───────────────────────────────────────────────────────────
-# The LLM evaluates each description. If the job matches ANY, it is skipped.
-disqualifiers:
-  - "The role or industry is manufacturing or any physical/non-software domain"
-  - "The role is unrelated to software quality, testing, or engineering"
 
-# ── Qualifiers ───────────────────────────────────────────────────────────────
-# The LLM evaluates each description. ALL must be true or the job is skipped.
-qualifiers:
-  - "The job is fully remote, or located in my preferred city"
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Non-secret model settings. API key stays in .env as OPENROUTER_API_KEY.
+model:
+  name: "openrouter/anthropic/claude-3.5-sonnet"   # model to use for scoring
+  base_url: "https://openrouter.ai/api/v1"         # LLM API base URL
+  parallel_workers: 10                             # concurrent LLM calls during scoring
 
-# ── Scoring criteria ─────────────────────────────────────────────────────────
-# Each job is scored across four categories. Set weights to reflect your priorities
-# (they will be normalized if they don't sum to 1.0). For each category, describe
-# your ideal match (score 10) and the worst possible match (score 1).
+# ── Criteria ──────────────────────────────────────────────────────────────────
+# Scoring instructions only — what makes a fetched job a good match.
+# Search params (what to scrape) live in the search: block above.
 criteria:
-  top_n: 10                          # number of top jobs to show in the report
+  name: "my-search-2026"             # used as the DB row name; change when criteria changes
+
+  # The LLM evaluates these. If the job matches ANY, it is skipped (disqualified).
+  disqualifiers:
+    - "The role or industry is manufacturing or any physical/non-software domain"
+    - "The role is unrelated to software quality, testing, or engineering"
+
+  # The LLM evaluates these. ALL must be true or the job is skipped.
+  qualifiers:
+    - "The job is fully remote, or located in my preferred city"
 
   weights:
     relevance: 0.34    # how well the title/role matches what I'm searching for
@@ -58,3 +64,12 @@ criteria:
   income:
     ideal: "Salary is at or above my target, stated or strongly implied."
     worst: "Salary is well below my minimum, or the role is short-term contract."
+
+# ── Display ───────────────────────────────────────────────────────────────────
+# Report and viewer display settings.
+display:
+  top_n: 10                          # number of top jobs to show in the report
+
+# ── Scoring (kept for backward-compat fallback) ───────────────────────────────
+scoring:
+  parallel_workers: 10

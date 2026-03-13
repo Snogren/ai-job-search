@@ -29,6 +29,7 @@ from config import load_config
 from database import (
     db_status,
     finish_scrape_run,
+    get_all_enabled_criteria,
     get_or_create_criteria,
     init_db,
     migrate_from_csv_json,
@@ -111,8 +112,13 @@ def main() -> None:
         _print_status()
         return
 
-    top_n = args.top if args.top is not None else criteria_cfg.get("top_n", 50)
-    parallel_workers = cfg.get("scoring", {}).get("parallel_workers", 10)
+    top_n = args.top if args.top is not None else (
+        cfg.get("display", {}).get("top_n") or criteria_cfg.get("top_n", 50)
+    )
+    parallel_workers = (
+        cfg.get("model", {}).get("parallel_workers")
+        or cfg.get("scoring", {}).get("parallel_workers", 10)
+    )
     today = datetime.now().strftime("%Y-%m-%d_%H%M%S")
     report_path = Path(args.output) if args.output else OUTPUT_DIR / f"results_{today}.md"
 
@@ -170,10 +176,14 @@ def main() -> None:
     # ── Analyze ───────────────────────────────────────────────────────────────
     if args.mode in ("analyze", "pipeline"):
         log.info("=== Analyzing jobs ===")
+        criteria_ids = get_all_enabled_criteria(DB_PATH)
+        if not criteria_ids:
+            # Fallback: use the just-resolved criteria_id (handles fresh DBs)
+            criteria_ids = [criteria_id]
         run_analysis(
             db_path=DB_PATH,
             cfg=cfg,
-            criteria_id=criteria_id,
+            criteria_id=criteria_ids,
             top_n=top_n,
             parallel_workers=parallel_workers,
         )

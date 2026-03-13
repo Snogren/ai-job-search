@@ -159,13 +159,20 @@ def fetch_himalayas(search_term: str, limit: int = 100) -> list[dict]:
             break  # last page
         offset += PAGE_SIZE
     log.info(f"Himalayas: {len(all_jobs)} results for '{search_term}'")
+
+    def _str(v, default: str = "") -> str:
+        """Coerce list or None to a flat string (Himalayas returns lists for some fields)."""
+        if isinstance(v, list):
+            return ", ".join(str(x) for x in v) if v else default
+        return str(v) if v is not None else default
+
     return [
         {
             "site": "himalayas",
             "title": j.get("title", ""),
             "company": j.get("companyName", ""),
-            "location": j.get("locationRestrictions", "remote") or "remote",
-            "job_type": j.get("jobType", ""),
+            "location": _str(j.get("locationRestrictions"), "remote") or "remote",
+            "job_type": _str(j.get("jobType"), ""),
             "job_url": j.get("applicationLink", ""),
             "description": j.get("description", ""),
         }
@@ -294,7 +301,7 @@ def scrape_one_combo(
     Returns the number of rows enqueued. Per-site errors are logged and
     swallowed so that one blocked site never cancels a full keyword run.
     """
-    from database import UPSERT_JOB_SQL  # local import avoids circular dependency
+    from database import UPSERT_JOB_SQL, make_canonical_key  # local import avoids circular dependency
 
     search_cfg = cfg.get("search", {})
     hours_old = search_cfg.get("hours_old", 72)
@@ -341,6 +348,7 @@ def scrape_one_combo(
                 row.get("location"),
                 row.get("job_type"),
                 row.get("description"),
+                make_canonical_key(row.get("title", ""), row.get("company", "")),
                 run_id,
             ),
         )
@@ -412,7 +420,7 @@ def ingest_parallel_keywords(
             if aid and akey:
                 api_rows.extend(fetch_adzuna(keyword, aid, akey))
 
-        from database import UPSERT_JOB_SQL
+        from database import UPSERT_JOB_SQL, make_canonical_key
         for row in api_rows:
             url = row.get("job_url", "").strip()
             if not url:
@@ -427,6 +435,7 @@ def ingest_parallel_keywords(
                     row.get("location"),
                     row.get("job_type"),
                     row.get("description"),
+                    make_canonical_key(row.get("title", ""), row.get("company", "")),
                     run_id,
                 ),
             )
