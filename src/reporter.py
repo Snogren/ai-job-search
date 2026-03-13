@@ -131,3 +131,78 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── DB-backed report ──────────────────────────────────────────────────────────
+
+def generate_report_from_db(db_path: "Path", output_path: "Path", top_n: int) -> "Path":  # type: ignore[name-defined]
+    """Generate a Markdown report directly from the DB (no intermediate JSON).
+
+    Reads from jobs_qualified view and job_insights. Called by main.py --mode report.
+    """
+    from database import _open_conn  # local import avoids circular dependency
+
+    conn = _open_conn(db_path)
+    top_jobs = conn.execute("SELECT * FROM jobs_qualified LIMIT ?", (top_n,)).fetchall()
+    latest_insight = conn.execute(
+        "SELECT skills_advice FROM job_insights ORDER BY analysis_date DESC LIMIT 1"
+    ).fetchone()
+    stats = conn.execute(
+        """
+        SELECT
+            (SELECT COUNT(*) FROM jobs)                              AS total_jobs,
+            (SELECT COUNT(*) FROM jobs_unscored)                     AS unscored_count,
+            (SELECT COUNT(*) FROM job_scores
+             WHERE is_qualified = 1
+               AND criteria_id = (SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1)
+            )                                                        AS qualified_count
+        """
+    ).fetchone()
+    conn.close()
+
+    from datetime import datetime
+
+    lines = [
+        f"# Job Search Results — {datetime.now():%Y-%m-%d}",
+        "",
+        f"> **Total in DB:** {stats['total_jobs']}  |  "
+        f"**Qualified:** {stats['qualified_count']}  |  "
+        f"**Unscored:** {stats['unscored_count']}",
+        "",
+        "---",
+        "",
+    ]
+    for i, job in enumerate(top_jobs, 1):
+        score = job["score_overall"]
+        lines.append(f"## {i}. {job['title']}")
+        lines.append(f"**{job['company']}** · {job['location'] or '—'} · {job['job_type'] or '—'}")
+        lines.append("")
+        lines.append(f"**Score:** {score_bar(score)}")
+        cat_parts = []
+        for label, key in (("Relevance", "score_relevance"), ("Duties", "score_duties"), ("Income", "score_income")):
+            v = job[key]
+            if v is not None:
+                cat_parts.append(f"{label} {int(v)}")
+        if cat_parts:
+            lines.append(f"**Breakdown:** {' · '.join(cat_parts)}")
+        reasoning = (job["reasoning"] or "").strip()
+        if reasoning:
+            lines.append(f"**Why:** {reasoning}")
+        url = job["job_url"] or ""
+        if url:
+            lines.append(f"**Apply:** [{url}]({url})")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    if latest_insight and latest_insight["skills_advice"]:
+        lines.append("## Skills Advice")
+        lines.append("")
+        lines.append(latest_insight["skills_advice"])
+        lines.append("")
+
+    content = "\n".join(lines)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content, encoding="utf-8")
+    log.info(f"Wrote report → {output_path}")
+    return output_path

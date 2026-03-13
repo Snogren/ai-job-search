@@ -1,8 +1,11 @@
 """
-src/scraper.py — Job Scraper (Milestone 2)
+src/scraper.py — Job Scraper (Milestone 2 / Phase 2 DB)
 
 Scrapes job listings from multiple boards using JobSpy and writes
 deduplicated results to output/jobs_raw_YYYY-MM-DD.csv.
+
+Also provides ingest_parallel_keywords() for the DB-backed pipeline: runs
+(keyword × location) combos in parallel, upserts results via SQLiteWriteQueue.
 
 Usage:
     python src/scraper.py                              # uses config.yaml defaults
@@ -11,11 +14,13 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import csv
 import logging
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import requests
 from jobspy import scrape_jobs
@@ -260,3 +265,172 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── DB-backed ingestion ───────────────────────────────────────────────────────
+
+def _get_keywords(cfg: dict[str, Any]) -> list[str]:
+    """Return the keywords list from config, supporting both 'keywords' and legacy 'term'."""
+    search_cfg = cfg.get("search", {})
+    keywords = search_cfg.get("keywords")
+    if keywords:
+        return [str(k) for k in keywords]
+    term = search_cfg.get("term")
+    if term:
+        return [str(term)]
+    return []
+
+
+def scrape_one_combo(
+    keyword: str,
+    location: str,
+    site: str,
+    run_id: int,
+    writer: "SQLiteWriteQueue",  # type: ignore[name-defined]  # imported below
+    cfg: dict[str, Any],
+) -> int:
+    """Scrape one (keyword, location, site) combination and enqueue upserts.
+
+    Returns the number of rows enqueued. Per-site errors are logged and
+    swallowed so that one blocked site never cancels a full keyword run.
+    """
+    from database import UPSERT_JOB_SQL  # local import avoids circular dependency
+
+    search_cfg = cfg.get("search", {})
+    hours_old = search_cfg.get("hours_old", 72)
+    results_wanted = search_cfg.get("results_per_site", 50)
+
+    is_remote = location.lower().strip() == "remote"
+    loc_str = None if is_remote else location
+
+    try:
+        df = scrape_jobs(
+            site_name=[site],
+            search_term=keyword,
+            location=loc_str,
+            is_remote=is_remote,
+            country_indeed="usa",
+            hours_old=hours_old,
+            results_wanted=results_wanted,
+            linkedin_fetch_description=True,
+        )
+    except Exception as e:
+        log.warning(f"[{site}] scrape failed for '{keyword}' @ {location}: {e}")
+        return 0
+
+    if df is None or df.empty:
+        return 0
+
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            df[col] = ""
+
+    rows = df[REQUIRED_COLUMNS].fillna("").to_dict(orient="records")
+    enqueued = 0
+    for row in rows:
+        url = row.get("job_url", "").strip()
+        if not url:
+            continue
+        writer.enqueue(
+            UPSERT_JOB_SQL,
+            (
+                url,
+                site,
+                row.get("title", ""),
+                row.get("company", ""),
+                row.get("location"),
+                row.get("job_type"),
+                row.get("description"),
+                run_id,
+            ),
+        )
+        enqueued += 1
+
+    log.info(f"[{site}] '{keyword}' @ {location}: {enqueued} rows enqueued")
+    return enqueued
+
+
+def ingest_parallel_keywords(
+    cfg: dict[str, Any],
+    db_path: "Path",  # type: ignore[name-defined]
+    run_id: int,
+    writer: "SQLiteWriteQueue",  # type: ignore[name-defined]
+    keyword_overrides: list[str] | None = None,
+    location_overrides: list[str] | None = None,
+) -> int:
+    """Scrape all (keyword × location × site) combos in parallel (3 workers).
+
+    Uses scrape_one_combo() per site so a blocked site never cancels a run.
+    Returns total rows enqueued across all combos.
+    """
+    search_cfg = cfg.get("search", {})
+    keywords = keyword_overrides or _get_keywords(cfg)
+    locations = location_overrides or [search_cfg.get("location", "remote")]
+    sites = search_cfg.get("sites", ["indeed", "zip_recruiter"])
+
+    if not keywords:
+        log.error("No keywords configured. Add 'search.keywords' to config.yaml.")
+        return 0
+
+    # Build flat list of (keyword, location, site) combos
+    combos = [
+        (kw, loc, site)
+        for kw in keywords
+        for loc in locations
+        for site in sites
+    ]
+    log.info(
+        f"Scraping {len(keywords)} keyword(s) × {len(locations)} location(s) × {len(sites)} site(s)"
+        f" = {len(combos)} combos (3 parallel workers)"
+    )
+
+    total = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {
+            pool.submit(scrape_one_combo, kw, loc, site, run_id, writer, cfg): (kw, loc, site)
+            for kw, loc, site in combos
+        }
+        for future in concurrent.futures.as_completed(futures):
+            kw, loc, site = futures[future]
+            try:
+                total += future.result()
+            except Exception as e:
+                log.error(f"Unexpected error for [{site}] '{kw}' @ {loc}: {e}")
+
+    # Also run API sources if configured
+    api_cfg = cfg.get("api_sources", {})
+    for keyword in keywords:
+        api_rows: list[dict] = []
+        if api_cfg.get("remotive", False):
+            api_rows.extend(fetch_remotive(keyword))
+        if api_cfg.get("himalayas", False):
+            api_rows.extend(fetch_himalayas(keyword))
+        adzuna_cfg = api_cfg.get("adzuna", {})
+        if isinstance(adzuna_cfg, dict):
+            aid = adzuna_cfg.get("app_id", "")
+            akey = adzuna_cfg.get("app_key", "")
+            if aid and akey:
+                api_rows.extend(fetch_adzuna(keyword, aid, akey))
+
+        from database import UPSERT_JOB_SQL
+        for row in api_rows:
+            url = row.get("job_url", "").strip()
+            if not url:
+                continue
+            writer.enqueue(
+                UPSERT_JOB_SQL,
+                (
+                    url,
+                    row.get("site", "api"),
+                    row.get("title", ""),
+                    row.get("company", ""),
+                    row.get("location"),
+                    row.get("job_type"),
+                    row.get("description"),
+                    run_id,
+                ),
+            )
+            total += 1
+
+    log.info(f"Ingestion complete: {total} total rows enqueued")
+    return total

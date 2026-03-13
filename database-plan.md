@@ -375,16 +375,33 @@ Load config (criteria, weights, qualifiers)
 - They touch different tables and WAL prevents conflicts.
 - Scoring threads only write to `job_scores` — no lock on `jobs`.
 
-**Re-scoring with new criteria:**
-```bash
-python main.py --mode analyze --rescore-all
-# Deletes job_scores rows, re-runs analysis with current criteria_hash
+**Scoring with new criteria:**
+
+No deletion needed. The schema makes this free:
+1. Insert a new row into `criteria` (or update `is_active`).
+2. Run `--mode analyze` — `jobs_unscored` already filters to jobs with no score under the active `criteria_id`.
+3. Scores from previous criteria remain intact and queryable.
+
+```sql
+-- Activate new criteria
+UPDATE criteria SET is_active = 0;  -- deactivate all
+UPDATE criteria SET is_active = 1 WHERE name = 'new-criteria-name';
+-- Then: python main.py --mode analyze
 ```
 
-**Detecting stale scores (criteria changed):**
+Rescoring the same job under the same criteria is intentionally not supported — `UNIQUE(job_id, criteria_id)` enforces this at the DB level.
+
+**Jobs not yet scored under the active criteria:**
 ```sql
-SELECT count(*) FROM job_scores
-WHERE criteria_hash != '<current_hash>';
+-- Use the jobs_unscored view (already filters by active criteria)
+SELECT COUNT(*) FROM jobs_unscored;
+
+-- Or directly:
+SELECT COUNT(*) FROM jobs j
+LEFT JOIN job_scores js
+       ON j.job_id = js.job_id
+      AND js.criteria_id = (SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1)
+WHERE js.score_id IS NULL;
 ```
 
 ---
@@ -424,12 +441,19 @@ def migrate_from_csv_json(db_path, csv_path=None, json_path=None):
                 (scored_job.get('job_url'),)
             ).fetchone()
             if row:
+                # Resolve active criteria_id (must exist before migrating scores)
+                criteria_row = conn.execute(
+                    "SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1"
+                ).fetchone()
+                if not criteria_row:
+                    logging.warning("No active criteria found; skipping score migration")
+                    break
                 conn.execute(
                     "INSERT OR IGNORE INTO job_scores "
-                    "(job_id, is_qualified, score_overall, score_relevance, "
+                    "(job_id, criteria_id, is_qualified, score_overall, score_relevance, "
                     " score_duties, score_income, reasoning, model_name) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (row[0], not scored_job.get('disqualified', False),
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (row[0], criteria_row[0], not scored_job.get('disqualified', False),
                      scored_job.get('score'), scored_job.get('score_relevance'),
                      scored_job.get('score_duties'), scored_job.get('score_income'),
                      scored_job.get('reasoning'), 'claude-3.5-sonnet')
@@ -461,7 +485,6 @@ python main.py                    # same as above
 
 # Overrides
 python main.py --mode scrape --keywords "python engineer" "backend engineer" --locations "remote" "NYC"
-python main.py --mode analyze --rescore-all
 python main.py --mode report --top 20 --output /tmp/jobs.md
 ```
 
@@ -471,7 +494,6 @@ python main.py --mode report --top 20 --output /tmp/jobs.md
 parser.add_argument('--mode', choices=['scrape', 'analyze', 'report', 'pipeline'], default='pipeline')
 parser.add_argument('--keywords', nargs='+')
 parser.add_argument('--locations', nargs='+')
-parser.add_argument('--rescore-all', action='store_true')
 parser.add_argument('--top', type=int)
 parser.add_argument('--output')
 ```
@@ -703,7 +725,7 @@ No intermediate JSON files. All data comes from the DB views.
 - [ ] Refactor `pipeline.py` to read from `jobs_unscored` view
 - [ ] Implement parallel scoring + `job_scores` insertion
 - [ ] Write insights to `job_insights` table
-- [ ] Update `main.py --mode analyze`, add `--rescore-all`
+- [ ] Update `main.py --mode analyze`
 
 ### Phase 4 — Reporting
 - [ ] Implement `generate_report_from_db()` in `reporter.py`
@@ -730,8 +752,13 @@ sqlite3 ai_job_search.db ".backup ai_job_search.db.$(date +%Y%m%d).bak"
 -- How many jobs haven't been scored yet?
 SELECT COUNT(*) FROM jobs_unscored;
 
--- Scores that are stale (criteria changed)?
-SELECT COUNT(*) FROM job_scores WHERE criteria_hash != '<current_hash>';
+-- Scores that are stale (criteria changed — jobs scored under inactive criteria)
+SELECT COUNT(*) FROM job_scores js
+JOIN criteria c ON js.criteria_id = c.criteria_id
+WHERE c.is_active = 0;
+
+-- Jobs with no score under the active criteria
+SELECT COUNT(*) FROM jobs_unscored;
 
 -- Jobs no longer seen in last 30 days (probably expired)
 SELECT COUNT(*) FROM jobs WHERE refreshed_at < datetime('now', '-30 days');
@@ -741,7 +768,10 @@ SELECT COUNT(*) FROM jobs WHERE refreshed_at < datetime('now', '-30 days');
 ```sql
 -- Partial index: only unscored jobs
 CREATE INDEX idx_jobs_unscored_partial ON jobs(job_id)
-WHERE job_id NOT IN (SELECT job_id FROM job_scores);
+WHERE job_id NOT IN (
+    SELECT job_id FROM job_scores
+    WHERE criteria_id = (SELECT criteria_id FROM criteria WHERE is_active = 1 LIMIT 1)
+);
 ```
 
 ---
@@ -794,7 +824,7 @@ The three patterns you identified are the right decomposition and map cleanly to
 
 2. **Scoring engine** (`pipeline.py`) has no knowledge of *how* jobs got into the DB or *how* scores get persisted — it reads a list of jobs, calls the LLM, and hands dicts to the write queue. Swapping CrewAI for another LLM client is a one-file change.
 
-3. **DB maintenance** is the weakest boundary today — it currently lives scattered across `main.py` (the `--rescore-all` flag), per-run scrape_run bookkeeping, and pragma calls. Pulling it into its own module (or a `main.py --db` subcommand) would make the separation explicit and allow scheduled maintenance without triggering a full pipeline run.
+3. **DB maintenance** is the weakest boundary today — it currently lives scattered across `main.py`, per-run scrape_run bookkeeping, and pragma calls. Pulling it into its own module (or a `main.py --db` subcommand) would make the separation explicit and allow scheduled maintenance without triggering a full pipeline run.
 
 **The scraper** (`scraper.py`) sits at the same level as the scoring engine — depends on storage, knows nothing about scoring. That's the right design.
 

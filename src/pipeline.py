@@ -1,13 +1,15 @@
 """
-src/pipeline.py — CrewAI Pipeline (Milestone 3)
+src/pipeline.py — CrewAI Pipeline (Milestone 3 / Phase 3 DB)
 
-Reads scraped job listings from a CSV, scores each with a Job Scorer agent,
-then passes the top results to a Skills Advisor agent for targeted advice.
-Writes output to output/scored_YYYY-MM-DD.json.
+Reads scraped job listings from a CSV (legacy) or the DB (new), scores each
+with a Job Scorer agent, then passes the top results to a Skills Advisor agent
+for targeted advice. Writes output to scored_*.json (legacy) or the DB (new).
 
-Usage:
+Legacy CSV usage:
     python src/pipeline.py --input output/jobs_raw_2026-03-11.csv
-    python src/pipeline.py --input output/jobs_raw_2026-03-11.csv --criteria "Python, FastAPI, remote" --top 10
+
+DB-backed usage (called from main.py --mode analyze):
+    run_analysis(db_path, cfg, criteria_id, top_n, parallel_workers)
 """
 
 import argparse
@@ -402,3 +404,151 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+# ── DB-backed analysis ────────────────────────────────────────────────────────
+
+def run_analysis(
+    db_path: Path,
+    cfg: dict,
+    criteria_id: int,
+    top_n: int = 50,
+    parallel_workers: int = 10,
+) -> int:
+    """Score all unscored jobs in the DB under the active criteria.
+
+    Reads from the jobs_unscored view (jobs with no score under criteria_id),
+    runs LLM scoring in parallel, writes results to job_scores via the write
+    queue, then runs the Skills Advisor and writes to job_insights.
+
+    Returns the number of jobs scored.
+    """
+    from database import (  # local import avoids circular dependency at module load
+        INSERT_INSIGHT_SQL,
+        INSERT_SCORE_SQL,
+        SQLiteWriteQueue,
+        get_unscored_jobs,
+        _open_conn,
+    )
+    from config import build_criteria_string, get_criteria_weights, get_disqualifiers, get_qualifiers
+
+    criteria = build_criteria_string(cfg)
+    weights = get_criteria_weights(cfg)
+    qualifiers = get_qualifiers(cfg)
+    disqualifiers = get_disqualifiers(cfg)
+    llm_config = get_llm_config()
+    model_name = llm_config["model"].split("/")[-1]
+
+    jobs = get_unscored_jobs(db_path)
+    if not jobs:
+        log.info("No unscored jobs found — nothing to analyze.")
+        return 0
+
+    log.info(f"Scoring {len(jobs)} unscored jobs ({parallel_workers} parallel workers)...")
+
+    writer = SQLiteWriteQueue(db_path)
+    scored_count = 0
+    qualified_count = 0
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+        futures = {
+            executor.submit(
+                score_single_job, job, criteria, llm_config, weights, qualifiers, disqualifiers
+            ): job
+            for job in jobs
+        }
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            job_id = futures[future].get("job_id")
+            if job_id is None:
+                continue
+
+            is_qualified = not result.get("disqualified", False)
+            dq_reason = result.get("disqualified_by") if not is_qualified else None
+
+            writer.enqueue(
+                INSERT_SCORE_SQL,
+                (
+                    job_id,
+                    criteria_id,
+                    is_qualified,
+                    dq_reason,
+                    result.get("score"),
+                    result.get("score_relevance"),
+                    result.get("score_duties"),
+                    result.get("score_income"),
+                    result.get("reasoning", ""),
+                    model_name,
+                ),
+            )
+            scored_count += 1
+            if is_qualified:
+                qualified_count += 1
+                score_str = f"{result['score']:.1f}/10" if result["score"] is not None else "?/10"
+                log.info(f"  ✓ {result['title']} @ {result['company']} → {score_str}")
+            else:
+                log.info(f"  ✗ Disqualified: '{result['title']}' — {dq_reason or ''}")
+
+    writer.flush()
+
+    # ── Skills Advisor ────────────────────────────────────────────────────────
+    conn = _open_conn(db_path)
+    top_rows = conn.execute(
+        "SELECT title, company, location, score_overall, reasoning"
+        " FROM jobs_qualified LIMIT ?",
+        (top_n,),
+    ).fetchall()
+    conn.close()
+
+    top_summary = "\n\n---\n\n".join(
+        f"Title: {r['title']}\nCompany: {r['company']}\nLocation: {r['location']}\n"
+        f"Score: {r['score_overall']}/10\nReasoning: {r['reasoning']}"
+        for r in top_rows
+        if r["score_overall"] is not None
+    )
+
+    if top_summary:
+        llm = get_llm(llm_config)
+        advisor_agent = Agent(
+            role="Skills Advisor",
+            goal=(
+                "Identify the most important skills the user should highlight or develop "
+                "based on the top-scoring job listings."
+            ),
+            backstory=(
+                "You are a senior tech recruiter who has reviewed thousands of job descriptions. "
+                "You can quickly identify patterns in what employers want and translate that "
+                "into concrete, actionable advice for job seekers."
+            ),
+            llm=llm,
+            verbose=False,
+            allow_delegation=False,
+        )
+        advisor_task = Task(
+            description=(
+                f"The user's current criteria: {criteria}\n\n"
+                f"Based on the following top-scoring job listings, identify:\n"
+                f"1. The top 3–5 skills that appear most frequently in high-scoring listings.\n"
+                f"2. Any skill gaps — skills that keep appearing but aren't in the user's criteria.\n"
+                f"3. One concrete action the user should take this week to improve their candidacy.\n\n"
+                f"Be specific and practical.\n\n"
+                f"Top listings:\n\n{top_summary}"
+            ),
+            expected_output=(
+                "A structured skills analysis with: top skills, skill gaps, and one recommended action."
+            ),
+            agent=advisor_agent,
+        )
+        crew = Crew(agents=[advisor_agent], tasks=[advisor_task], verbose=False)
+        log.info("Running Skills Advisor...")
+        crew.kickoff()
+        skills_advice = strip_thinking_tags(advisor_task.output.raw if advisor_task.output else "")
+        writer.enqueue(INSERT_INSIGHT_SQL, (skills_advice, scored_count, model_name))
+
+    writer.close()
+
+    log.info(
+        f"Analysis complete: {scored_count} scored, {qualified_count} qualified,"
+        f" {scored_count - qualified_count} disqualified"
+    )
+    return scored_count
